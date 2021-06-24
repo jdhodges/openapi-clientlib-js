@@ -133,6 +133,7 @@ class Streaming extends MicroEmitter<EmittedEvents> {
     isReset = false;
     paused = false;
     orphanFinder: StreamingOrphanFinder;
+    orphanEvents: Array<{ datetime: number; servicePath: string }> = [];
     connection!: Connection;
     connectionOptions: types.ConnectionOptions = {
         waitForPageLoad: false,
@@ -699,6 +700,10 @@ class Streaming extends MicroEmitter<EmittedEvents> {
             },
         );
 
+        this.reconnect();
+    }
+
+    private reconnect() {
         this.isReset = true;
 
         // tell all subscriptions not to do anything
@@ -747,6 +752,60 @@ class Streaming extends MicroEmitter<EmittedEvents> {
             'Subscription has become orphaned - resetting',
             subscription,
         );
+        const now = Date.now();
+        const lastMinute = now - 60 * 1000;
+        this.orphanEvents = this.orphanEvents.filter(
+            (orphanEvent) => orphanEvent.datetime < lastMinute,
+        );
+        this.orphanEvents.push({
+            datetime: now,
+            servicePath: subscription.servicePath,
+        });
+
+        const orphansByServicePath: Record<
+            string,
+            { min: number; max: number }
+        > = {};
+        for (const orphanEvent of this.orphanEvents) {
+            const orphanSpInfo = orphansByServicePath[orphanEvent.servicePath];
+            if (orphanSpInfo) {
+                orphanSpInfo.min = Math.min(
+                    orphanSpInfo.min,
+                    orphanEvent.datetime,
+                );
+                orphanSpInfo.max = Math.max(
+                    orphanSpInfo.max,
+                    orphanEvent.datetime,
+                );
+            } else {
+                orphansByServicePath[orphanEvent.servicePath] = {
+                    min: orphanEvent.datetime,
+                    max: orphanEvent.datetime,
+                };
+            }
+        }
+
+        let servicePathFailures = 0;
+        for (const servicePath of Object.keys(orphansByServicePath)) {
+            if (
+                orphansByServicePath[servicePath].max -
+                    orphansByServicePath[servicePath].min >
+                20 * 1000
+            ) {
+                servicePathFailures++;
+            }
+        }
+
+        // multiple service paths have failed multiple times, more than 20 seconds apart, within the same minute
+        if (servicePathFailures > 2) {
+            log.error(
+                LOG_AREA,
+                'Detected multiple service paths hitting orphans, multiple times',
+            );
+            this.reconnect();
+            return;
+        }
+
         this.connection.onOrphanFound();
         subscription.reset();
     }
